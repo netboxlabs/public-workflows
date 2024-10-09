@@ -1,0 +1,12 @@
+name: Reusable public - Plugin manifest modified
+
+on:
+  workflow_call:
+
+jobs:
+  preflight:
+    name: Preflight checks 
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
