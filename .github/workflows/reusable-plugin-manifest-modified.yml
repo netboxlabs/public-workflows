@@ -10,3 +10,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: "Check plugin manifest exists"
+        uses: andstor/file-existence-action@v3
+        with:
+          files: "netbox-plugin.yaml"
+          fail: true
