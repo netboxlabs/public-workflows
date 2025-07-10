@@ -1,0 +1,304 @@
+name: Reusable - Plugin release
+
+on:
+  workflow_call:
+    inputs:
+      plugin_package_name:
+        description: "Published package name"
+        type: string
+        required: true
+      plugin_package_dir:
+        description: "Directory that contains version.py"
+        type: string
+        required: true
+      release_notes_from_pr_body:
+        description: "Populate the release notes from the PR body"
+        required: false
+        type: boolean
+        default: false
+      create_pr_to_default_branch:
+        description: "Create a PR to the default branch"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  PYTHON_RUNTIME_VERSION: "3.11"
+
+jobs:
+  preflight:
+    name: Preflight checks 
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Check file existence"
+        uses: andstor/file-existence-action@v3
+        with:
+          files: "pyproject.toml, netbox-plugin.yaml, ${{ inputs.plugin_package_dir }}/__init__.py, ${{ inputs.plugin_package_dir }}/version.py"
+          fail: true
+# TODO: read netbox-plugin.yaml, confirm version is 0.1 and package_name matches the input package name
+# TODO: ensure setup.py setup.cfg are not present
+
+  get-next-version:
+    name: Semantic release get next version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ preflight ]
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+      - name: Write package.json
+        uses: DamianReeves/write-file-action@master
+        with:
+          path: ./package.json
+          write-mode: overwrite
+          contents: |
+            {
+              "name": "${{ env.APP_NAME }}",
+              "version": "1.0.0",
+              "devDependencies": {
+                "semantic-release-export-data": "^1.0.1",
+                "@semantic-release/changelog": "^6.0.3"
+              }
+            }
+      - name: Write .releaserc.json
+        uses: DamianReeves/write-file-action@master
+        with:
+          path: ./.releaserc.json
+          write-mode: overwrite
+          contents: |
+            {
+              "branches": "release",
+              "repositoryUrl": "https://github.com/netboxlabs/${{ github.event.repository.name }}",
+              "debug": "true",
+              "tagFormat": "v${version}",
+              "plugins": [
+                ["semantic-release-export-data"],
+                ["@semantic-release/commit-analyzer", {
+                  "releaseRules": [
+                    { "message": "*", "release": "patch"},
+                    { "message": "fix*", "release": "patch" },
+                    { "message": "feat*", "release": "minor" },
+                    { "message": "perf*",  "release": "major" }
+                  ]
+                }],
+                "@semantic-release/release-notes-generator",
+                [
+                  "@semantic-release/changelog",
+                  {
+                    "changelogFile": "CHANGELOG.md",
+                    "changelogTitle": "# Semantic Versioning Changelog"
+                  }
+                ],
+                [
+                  "@semantic-release/github",
+                  {
+                    "assets": [
+                      {
+                        "path": "release/**"
+                      }
+                    ]
+                  }
+                ]
+              ]
+            }
+      - name: setup semantic-release
+        run: npm i
+      - name: release dry-run
+        run: npx semantic-release --debug --dry-run
+        id: get-next-version
+      - name: Set short sha output
+        id: short-sha
+        run: echo "::set-output name=short-sha::${GITHUB_SHA::7}"
+      - name: Set release version
+        id: release-version
+        run: |
+          echo "::set-output name=release-version::`echo ${{ steps.get-next-version.outputs.new-release-version }} | sed 's/v//g'`"
+    outputs:
+      new-release-published: ${{ steps.get-next-version.outputs.new-release-published }}
+      new-release-version: ${{ steps.release-version.outputs.release-version }}
+      short-sha: ${{ steps.short-sha.outputs.short-sha }}
+
+  build:
+    name: Build
+    needs: [ get-next-version ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    env:
+      BUILD_VERSION: ${{ needs.get-next-version.outputs.new-release-version }}
+      BUILD_TRACK: release
+      BUILD_COMMIT: ${{ needs.get-next-version.outputs.short-sha }}
+      OUTPUT_FILENAME: ${{ inputs.plugin_package_name }}-${{ needs.get-next-version.outputs.new-release-version }}.tar.gz
+    outputs:
+      release-filename: ${{ env.OUTPUT_FILENAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_RUNTIME_VERSION }}
+      - name: Overwrite version.py
+        uses: "DamianReeves/write-file-action@master"
+        with:
+          path: ${{ inputs.plugin_package_dir }}/version.py
+          write-mode: overwrite
+          contents: |
+            #!/usr/bin/env python
+            # Copyright 2024 NetBox Labs Inc
+            """Version stamp."""
+            
+            # These properties are injected at build time by the build process.
+            
+            __commit_hash__ = "${{ env.BUILD_COMMIT }}"
+            __track__ = "${{ env.BUILD_TRACK }}"
+            __version__ = "${{ env.BUILD_VERSION }}"
+            __version_injection_template__ = 1
+            
+            def version_display():
+                """Display the version, track and hash together."""
+                return f"v{__version__}-{__track__}-{__commit_hash__}"
+            
+            
+            def version_semver():
+                """Semantic version."""
+                return __version__
+   
+      - name: Display contents of version.py
+        run: cat ${{ inputs.plugin_package_dir }}/version.py
+      - name: Build sdist package
+        run: |
+          python3 -m pip install toml-cli
+          toml set --toml-path pyproject.toml project.version ${{ env.BUILD_VERSION }}
+          cat pyproject.toml | grep version
+          python3 -m pip install --upgrade build
+          python3 -m build --sdist --outdir dist/
+      - name: Replace underscores with hyphens in build filename
+        run: |
+          BUILD_FILENAME=$(ls dist/ | grep tar.gz)
+          mv dist/$BUILD_FILENAME dist/${{ env.OUTPUT_FILENAME }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_FILENAME }}
+          path: dist/${{ env.OUTPUT_FILENAME }}
+          retention-days: 30
+          if-no-files-found: error
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+      - name: Write package.json
+        uses: DamianReeves/write-file-action@master
+        with:
+          path: ./package.json
+          write-mode: overwrite
+          contents: |
+            {
+              "name": "${{ inputs.plugin_package_name }}",
+              "version": "1.0.0",
+              "devDependencies": {
+                "semantic-release-export-data": "^1.0.1",
+                "@semantic-release/changelog": "^6.0.3",
+                "@semantic-release/git": "^10.0.1"
+              }
+            }
+      - uses: 8BitJonny/gh-get-current-pr@3.0.0
+        id: pull-request
+      - name: Format release notes
+        id: format-pull-request
+        run: |
+          PR_BODY_TEXT=$(echo -e '${{ steps.pull-request.outputs.pr_body }}' | sed -E ':a;N;$!ba;s/\r{0,1}\n/\\n/g')
+          echo "PR_BODY_TEXT=${{ inputs.release_notes_from_pr_body && '${PR_BODY_TEXT}' || '<%= nextRelease.notes %>' }}" >> $GITHUB_OUTPUT
+      - name: Write .releaserc.json
+        uses: DamianReeves/write-file-action@master
+        with:
+          path: ./.releaserc.json
+          write-mode: overwrite
+          contents: |
+            {
+              "branches": "release",
+              "repositoryUrl": "https://github.com/netboxlabs/${{ github.event.repository.name }}",
+              "debug": "true",
+              "tagFormat": "v${version}",
+              "plugins": [
+                ["semantic-release-export-data"],
+                ["@semantic-release/commit-analyzer", {
+                  "releaseRules": [
+                    { "message": "*", "release": "patch"},
+                    { "message": "fix*", "release": "patch" },
+                    { "message": "feat*", "release": "minor" },
+                    { "message": "perf*",  "release": "major" }
+                  ]
+                }],
+                "@semantic-release/release-notes-generator",
+                [
+                  "@semantic-release/changelog",
+                  {
+                    "changelogFile": "CHANGELOG.md",
+                    "changelogTitle": "# Semantic Versioning Changelog"
+                  }
+                ],
+                [
+                  "@semantic-release/github",
+                  {
+                    "assets": [
+                      {
+                        "path": "dist/${{ env.OUTPUT_FILENAME }}"
+                      }
+                    ],
+                    "releaseBodyTemplate": "${{ steps.format-pull-request.outputs.PR_BODY_TEXT }}"
+                  }
+                ],
+                [
+                  "@semantic-release/git",
+                  {
+                    "assets": [
+                      "${{ inputs.plugin_package_dir }}/version.py",
+                      "pyproject.toml"
+                    ]
+                  }
+               ]
+              ]
+            }
+      - name: debug
+        run: |
+          cat ./.releaserc.json
+      - name: setup semantic-release
+        run: npm i
+      - name: Release
+        run: npx semantic-release --debug
+      - name: Create pull request to default branch
+        if: ${{ inputs.create_pr_to_default_branch }}
+        run: |
+          PR_TITLE="Merge release to ${{ github.event.repository.default_branch }} - v${{ needs.get-next-version.outputs.new-release-version }}"
+          PR_BODY="Sync ${{ github.event.repository.default_branch }} branch with release branch after release of v${{ needs.get-next-version.outputs.new-release-version }}"
+          gh pr create --title "${PR_TITLE}" --body "${PR_BODY}" --base ${{ github.event.repository.default_branch }} --head release
+
+  publish-to-pypi:
+    name: Publish to PyPi
+    needs: [ build ]
+    if: always()
+    env:
+      OUTPUT_FILENAME: ${{ needs.build.outputs.release-filename }}
+    permissions:
+      id-token: write
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_FILENAME }}
+      # TODO: extract dists/
+      # TODO: optionally set pypi password if OIDC is not being used.
+      - name: Publish distribution 📦 to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

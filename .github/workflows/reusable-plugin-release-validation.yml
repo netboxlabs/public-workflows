@@ -1,0 +1,13 @@
+name: Reusable - Plugin release validation
+
+on:
+  workflow_call:
+    inputs:
+      plugin_package_name:
+        description: "Published package name"
+        type: string
+        required: true
+      plugin_package_dir:
+        description: "Directory that contains version.py"
+        type: string
+        required: true
